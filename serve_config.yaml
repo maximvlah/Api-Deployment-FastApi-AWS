@@ -1,0 +1,15 @@
+# AWS Config
+# Both the bucket and dynamodb table are currently running on eu-central-1 
+# and contain latest Open Food Facts Data.
+region_name: "eu-central-1"
+table_name: "open-food-facts"   # DynamoDB table name
+bucket_name: "open-food-facts"  # S3 bucket name
+
+# TFX Embedder model Config
+# Replace localhost with ip of the running TFX server
+tfx_endpoint: http://localhost:8501/v1/models/embedder:predict
+
+# Vector Search Config
+embedding_size: 2048 # size of the embedding vectors (num of features) which is calculated by the TFX model
+metric: "angular"    # type of distance metric which was used when creating the search index
+k: 10                # number of best matches to return
