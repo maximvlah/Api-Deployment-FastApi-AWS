@@ -9,12 +9,11 @@ import yaml
 import boto3
 import base64
 import pickle
+import tarfile
+import urllib.request
 
-import os
-import json
 import base64
 from io import BytesIO
-import requests
 
 from annoy import AnnoyIndex
 
@@ -22,8 +21,6 @@ from tqdm import tqdm
 
 import tensorflow as tf
 import tensorflow_hub as hub
-# from tensorflow.keras.applications.mobilenet_v2 import MobileNetV2, preprocess_input, decode_predictions
-from tensorflow.keras.applications.efficientnet import preprocess_input
 
 from urllib.parse import urlparse
 
@@ -35,7 +32,7 @@ from typing import Optional, List
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from pydantic import BaseModel, validator
+from pydantic import BaseModel
 
 import numpy as np
 
@@ -47,7 +44,7 @@ from mangum import Mangum
 THREAD_COUNT = int(os.environ.get('THREAD_COUNT', 5))
 """The number of threads used to download and process image content."""
 
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 4))
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))
 """The number of images to process in a batch."""
 
 TIMEOUT = int(os.environ.get('TIMEOUT', 30))
@@ -59,10 +56,9 @@ logger = logging.getLogger(__name__)
 
 class HealthCheck(BaseModel):
     """
-    Represents an image to be predicted.
+    Health check.
     """
     message: Optional[str] = 'OK'
-
 
 class ImageInput(BaseModel):
     """
@@ -72,29 +68,17 @@ class ImageInput(BaseModel):
     data: Optional[str] = None
 
 
-class ImageOutput(BaseModel):
-    """
-    Represents the result of a prediction
-    """
-    embedding: List[float] = None
-
-class PredictRequest(BaseModel):
+class ProductSearchRequest(BaseModel):
     """
     Represents a request to process
     """
     images: List[ImageInput] = []
 
-class PredictResponse(BaseModel):
-    """
-    Represents a request to process
-    """
-    embeddings: List[ImageOutput] = []
-
 class ProductSearchResponse(BaseModel):
     """
-    Represents a request to process
+    Represents the result of a product search request
     """
-    best_matches: dict = None
+    search_results: dict = None
 
 class ImageNotDownloadedException(Exception):
     pass
@@ -102,11 +86,12 @@ class ImageNotDownloadedException(Exception):
 def download_files_from_s3(bucket_name,
                            s3_client,
                            files):
-    """Downloads files from S3 bucket
-    Args:
-        bucket_name (str): name of S3 bucket
-        s3_client (boto3.client): S3 client
-        files (list[str]): list of files to download
+    """
+    Downloads files from S3 bucket
+    
+    :param bucket_name (str): name of S3 bucket
+    :param s3_client (boto3.client): S3 client
+    :param files (list[str]): list of files to download
     """
     # Get list of files in S3 bucket
     for f in tqdm(files, desc="Downloading files from S3", total=len(files)):
@@ -116,15 +101,15 @@ def download_files_from_s3(bucket_name,
         else:
             print(f"{f} already exists!")
     
-def retireve_data_from_aws(idxs,s3_client,table,partition_key="code"):
-    """Retrieves data for product from AWS
-    Args:
-        idxs (list[int]): best match idxs
-        s3_client (boto3.client): S3 client
-        table (boto3.dynamodb.Table): DynamoDB table
+def retrieve_data_from_aws(idxs,s3_client,table,partition_key="code"):
+    """
+    Retrieves data for product from AWS
     
-    Returns:
-        data (dict): data for best matches
+    :param idxs (list[int]): best match idxs
+    :param s3_client (boto3.client): S3 client
+    :param table (boto3.dynamodb.Table): DynamoDB table
+    
+    :return: data (dict): data for best matches
     """
 
     search_results = {}
@@ -156,13 +141,11 @@ def load_annoy(path,
     """
     Loads Annoy Index from disk
 
-    Args:
-        path (str): path to Annoy Index
-        num_dimensions (int): number of dimensions of the embedding vector
-        metric (str): metric to use for Annoy Index
+    :param path (str): path to Annoy Index
+    :param num_dimensions (int): number of dimensions of the embedding vector
+    :param metric (str): metric to use for Annoy Index
 
-    Returns:
-        annoy_index (AnnoyIndex): Annoy Index
+    :return: annoy_index (AnnoyIndex): Annoy Index
 
     """
 
@@ -173,11 +156,11 @@ def load_annoy(path,
     return annoy_index
 
 def img2b64(image):
-    """Converts PIL image to Base64 encoded string
-    Args:
-        image (PIL.image)
-    Returns:
-        b64 (str): Base64 encoded string
+    """
+    Converts PIL image to Base64 encoded string
+    
+    :param image (PIL.image)
+    :return: b64 (str): Base64 encoded string
     """
 
     buff = BytesIO()
@@ -195,7 +178,108 @@ def b642bytes(b64_string):
     bytes = base64.b64decode(bytes)
     return bytes
 
-with open("serve_config.yaml", "r") as stream:
+
+class ImageEmbedder:
+    """
+    Calculates image embedding.
+    """
+    def __init__(self,
+                 model_url:str,
+                 input_width:int=224,
+                 input_height:int=224,
+                 input_channels:int=3):
+        """
+        Prepares the model used by the application for use.
+
+        :param model_url
+        :param input_width
+        :param input_height
+        :param input_channels
+        """
+
+        self.save_dir = "models/latest"
+        
+        self._download_model(model_url)
+        if "tfhub" in model_url:
+            # Load tfhub module
+            self.model = tf.keras.Sequential([hub.KerasLayer(self.save_dir,trainable=False)])
+        else:
+            # Load keras model
+            self.model = tf.keras.models.load_model(self.save_dir)
+
+        self.input_width = input_width
+        self.input_height = input_height
+        self.input_channels = input_channels
+        self.model.build([None, self.input_width, self.input_height, self.input_channels])
+    
+    def _download_model(self,url:str,save_dir:str="models/latest"):
+        """
+        Downloads latest embedder model.
+        :param url:string
+        :param save_dir:string
+        """
+
+        os.makedirs(save_dir,exist_ok=True)
+
+        if not os.path.exists(save_dir +"/saved_model.pb"):
+            logger.info("Downloading latest embedder model..")
+            archive_name = "model.tar.gz"
+            urllib.request.urlretrieve(
+                url,
+                os.path.join(save_dir,archive_name)
+            )
+
+            with tarfile.open(os.path.join(save_dir,archive_name), "r:gz") as f:
+                f.extractall(save_dir)
+                
+            os.remove(os.path.join(save_dir,archive_name))
+        else:
+            logger.info("Model already exists. Skipping download.")
+
+    def _preprocess_img(self,bytes):
+        """
+        Processes image bytes in format suitable for tf inference
+
+        :param bytes (bytes)
+        :return: img (np.array): preprocessed image
+        """
+        img = tf.io.decode_image(bytes,channels=self.input_channels)
+
+        img = tf.image.resize(img, 
+                              method="bilinear", 
+                              size=(self.input_width,self.input_height))
+        img = tf.keras.preprocessing.image.img_to_array(img)
+
+        img = img /255.0
+        return img
+
+    def _prepare_images(self, images):
+        """
+        Prepares the images for prediction.
+
+        :param images: The list of images to prepare for prediction in bytes format.
+
+        :return: A list of processed images.
+        """
+        batch = np.zeros((len(images), self.input_height, self.input_width, self.input_channels), dtype=np.float32)
+        for i, image_bytes in enumerate(images):
+            batch[i, :] = np.array(self._preprocess_img(image_bytes), dtype=np.float32)
+        return batch
+
+    def predict(self, images, batch_size:int):
+        """
+        Calculates embeddings.
+
+        :param images: A list of images to use.
+        :param batch_size: The number of images to process at once.
+
+        :return: A tensor containing the embeddings for each image.
+        """
+        batch = self._prepare_images(images)
+        embeddings = self.model.predict(batch, batch_size)
+        return embeddings
+
+with open("config.yaml", "r") as stream:
     try:
         CONFIG = (yaml.safe_load(stream))
     except yaml.YAMLError as exc:
@@ -214,8 +298,11 @@ table = dynamodb.Table(CONFIG["table_name"])
 s3_client = boto3.client('s3',region_name=CONFIG["region_name"])
 
 # Download files needed for vector search from S3
-# TODO: What if the search index will be very large?
-files = ["search_index.ann","idx_to_ean_map.pickle"]
+# TODO: What if the search index will be very large? Won't fit into AWS Lambda!
+files = [
+    "search_index.ann",
+    "idx_to_ean_map.pickle"
+]
 download_files_from_s3(CONFIG["bucket_name"],
                        s3_client,
                        files)
@@ -227,7 +314,6 @@ with open("idx_to_ean_map.pickle", "rb") as f:
 # Load Annoy Search Index
 annoy = load_annoy("search_index.ann", CONFIG["embedding_size"], CONFIG["metric"])
 
-
 @app.exception_handler(Exception)
 async def unknown_exception_handler(request: Request, exc: Exception):
     """
@@ -235,25 +321,12 @@ async def unknown_exception_handler(request: Request, exc: Exception):
     """
     return JSONResponse(status_code=500, content={'message': 'Internal error.'})
 
-
 @app.exception_handler(ImageNotDownloadedException)
 async def client_exception_handler(request: Request, exc: ImageNotDownloadedException):
     """
     Called when the image could not be downloaded.
     """
     return JSONResponse(status_code=400, content={'message': 'One or more images could not be downloaded.'})
-
-
-@app.on_event('startup')
-def load_model():
-    """
-    Loads the model prior to the first request.
-    """
-    if not hasattr(app.state, 'model'):
-        configure_logging()
-        logger.info('Loading models...')
-        app.state.model = ImageEmbedder()
-
 
 def configure_logging(logging_level=logging.INFO):
     """
@@ -267,112 +340,18 @@ def configure_logging(logging_level=logging.INFO):
     root.setLevel(logging_level)
     root.addHandler(stream_handler)
 
-
-# class ImageClassifier:
-#     """
-#     Classifies images according to ImageNet categories.
-#     """
-#     def __init__(self):
-#         """
-#         Prepares the model used by the application for use.
-#         """
-#         self.model = MobileNetV2()
-#         _, height, width, channels = self.model.input_shape
-#         self.input_width = width
-#         self.input_height = height
-#         self.input_channels = channels
-
-#     def _prepare_images(self, images):
-#         """
-#         Prepares the images for prediction.
-
-#         :param images: The list of images to prepare for prediction in Pillow Image format.
-
-#         :return: A list of processed images.
-#         """
-#         batch = np.zeros((len(images), self.input_height, self.input_width, self.input_channels), dtype=np.float32)
-#         for i, image in enumerate(images):
-#             x = image.resize((self.input_width, self.input_height), Image.BILINEAR)
-#             batch[i, :] = np.array(x, dtype=np.float32)
-#         batch = preprocess_input(batch)
-#         return batch
-
-#     def predict(self, images, batch_size):
-#         """
-#         Predicts the category of each image.
-
-#         :param images: A list of images to classify.
-#         :param batch_size: The number of images to process at once.
-
-#         :return: A list containing the predicted category and confidence score for each image.
-#         """
-#         batch = self._prepare_images(images)
-#         scores = self.model.predict(batch, batch_size)
-#         results = decode_predictions(scores, top=1)
-#         return results
-
-class ImageEmbedder:
+@app.on_event('startup')
+def load_model():
     """
-    Calculates image embedding.
+    Loads the model prior to the first request.
     """
-    def __init__(self):
-        """
-        Prepares the model used by the application for use.
-        """
-        # self.model = tf.keras.models.load_model("/home/maxim/projects/ourz/Api-Deployment-FastApi-AWS/models/embedder")
-        m = tf.keras.Sequential([hub.KerasLayer("https://tfhub.dev/tensorflow/resnet_50/feature_vector/1",trainable=False),
-        ])
-        m.build([None, 224, 224, 3])
-
-        self.model = m
-
-        _, height, width, channels = None,224,224,3
-        self.input_width = width
-        self.input_height = height
-        self.input_channels = channels
-
-    def _preprocess_img(self,bytes):
-        """
-        Processes image bytes in format suitable for tf inference
-
-        :param bytes (bytes)
-        :return img (np.array): preprocessed image
-        """
-        img = tf.io.decode_image(bytes,channels=self.input_channels)
-
-        img = tf.image.resize(img, 
-                              method="bilinear", 
-                              size=(self.input_width,self.input_height))
-        img = tf.keras.preprocessing.image.img_to_array(img)
-        return img
-
-    def _prepare_images(self, images):
-        """
-        Prepares the images for prediction.
-
-        :param images: The list of images to prepare for prediction in Pillow Image format.
-
-        :return: A list of processed images.
-        """
-        batch = np.zeros((len(images), self.input_height, self.input_width, self.input_channels), dtype=np.float32)
-        for i, image_bytes in enumerate(images):
-            # x = image.resize((self.input_width, self.input_height), Image.BILINEAR)
-            batch[i, :] = np.array(self._preprocess_img(image_bytes), dtype=np.float32)
-        batch = preprocess_input(batch)
-        return batch
-
-    def predict(self, images, batch_size):
-        """
-        Predicts the category of each image.
-
-        :param images: A list of images to classify.
-        :param batch_size: The number of images to process at once.
-
-        :return: A list containing the predicted category and confidence score for each image.
-        """
-        batch = self._prepare_images(images)
-        embeddings = self.model.predict(batch, batch_size)
-        return embeddings
+    if not hasattr(app.state, 'model'):
+        configure_logging()
+        logger.info('Loading models...')
+        app.state.model = ImageEmbedder(CONFIG["model_url"],
+                                        CONFIG["input_width"],
+                                        CONFIG["input_height"],
+                                        CONFIG["input_channels"])
 
 def get_url_scheme(url, default_scheme='unknown'):
     """
@@ -386,22 +365,19 @@ async def retrieve_content(entry, sess, sem):
     """
     Retrieves the image content for the specified entry.
     """
-    raw_data = None
+    image_bytes = None
     if entry.data is not None:
-        # raw_data = base64.b64decode(entry.data)
-        raw_data = b642bytes(entry.data)
+        image_bytes = b642bytes(entry.data)
+        return image_bytes
+
     elif entry.url is not None:
         source_uri = entry.url
         scheme = get_url_scheme(source_uri)
         if scheme in ('http', 'https'):
-            raw_data = await download(source_uri, sess, sem)
+            image_bytes = await download(source_uri, sess, sem)
+            return image_bytes
         else:
             raise ValueError('Invalid scheme: %s' % scheme)
-    if raw_data is not None:
-        # image = Image.open(io.BytesIO(raw_data))
-        # image = image.convert('RGB')
-        # return image
-        return raw_data
     return None
 
 
@@ -453,17 +429,13 @@ def predict_images(images):
 
     :return: The prediction results.
     """
-    response = list()
-    results = app.state.model.predict(images, BATCH_SIZE)[0]
-    print(results.shape)
-
-    # response.append(ImageOutput(embedding=results.tolist()))
+    results = app.state.model.predict(images, BATCH_SIZE)
     return results
 
 @app.post('/v1/predict', response_model=ProductSearchResponse)
-async def process(req: PredictRequest):
+async def process(req: ProductSearchRequest):
     """
-    Predicts the category of the images contained in the request.
+    Calculates feature vectors of the images contained in the request.
 
     :param req: The request object containing the image data to predict.
 
@@ -471,17 +443,20 @@ async def process(req: PredictRequest):
     """
     logger.info('Processing request...')
     logger.debug(req.json())
-    logger.info('Downloading images...')
+    logger.info(f'Downloading & processing {len(req.images)} images...')
     images = await retrieve_images(req.images)
     logger.info('Performing prediction...')
     predictions = predict_images(images)
-    logger.info('Searching...')
-    best_matches_idxs = annoy.get_nns_by_vector(predictions,CONFIG["k"])
-    logger.info('Retrieving data from AWS...')
-    search_results = retireve_data_from_aws(best_matches_idxs,s3_client,table)
+
+    search_results = {}
+    for i in range(predictions.shape[0]):
+        logger.info(f'Searching for {i}nth image...')
+        best_matches_idxs = annoy.get_nns_by_vector(predictions[i],CONFIG["k"])
+        logger.info('Retrieving data from AWS...')
+        search_results[str(i)] = retrieve_data_from_aws(best_matches_idxs,s3_client,table)
     logger.info('Transaction complete.')
 
-    return ProductSearchResponse(best_matches=search_results)
+    return ProductSearchResponse(search_results=search_results)
 
 @app.get('/health')
 def test():

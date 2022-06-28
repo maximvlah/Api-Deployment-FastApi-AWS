@@ -70,33 +70,17 @@ In this section we will introduce and describe each part of the API. The full co
 
 Our first step is to create a new virtual environment &mdash;an isolated, working copy of Python. 
 
-For this tutorial, I will use [Conda](https://docs.conda.io/en/latest/) to create a new Python 3.7 virtual environment and activate it.
+For this tutorial, I will use [Venv] to create a new Python 3 virtual environment and activate it.
 
 ```bash
-conda create -n ApiDeployment python=3.7
-conda activate ApiDeployment
+python -m python venv
+. venv/bin/activate
 ```
 
 We can then install the dependencies, listed in the `requirements.txt` file into the virtual environment:
 
 ```bash
 pip install -r requirements.txt
-```
-
-Let's have a look at some of the dependent packages that we will be using:
-
-```bash
-Pillow==8.2.0
-tensorflow==2.4.2
-numpy==1.19.5
-fastapi==0.65.2
-pydantic==1.8.2
-aiohttp==3.7.3
-uvloop==0.14.0
-uvicorn[standard]==0.14.0
-gunicorn==20.1.0
-aiofiles==0.7.0
-mangum==0.12.2
 ```
 
 ### Imports and Logging

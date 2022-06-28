@@ -5,9 +5,11 @@ region_name: "eu-central-1"
 table_name: "open-food-facts"   # DynamoDB table name
 bucket_name: "open-food-facts"  # S3 bucket name
 
-# TFX Embedder model Config
-# Replace localhost with ip of the running TFX server
-tfx_endpoint: http://localhost:8501/v1/models/embedder:predict
+# Latest model weights
+model_url: "https://tfhub.dev/tensorflow/resnet_50/feature_vector/1?tf-hub-format=compressed"
+input_width: 224
+input_height: 224
+input_channels: 3
 
 # Vector Search Config
 embedding_size: 2048 # size of the embedding vectors (num of features) which is calculated by the TFX model
